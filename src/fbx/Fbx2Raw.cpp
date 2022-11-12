@@ -62,6 +62,21 @@ static std::string NativeToUTF8(const std::string& str) {
 #endif
 }
 
+static FbxAMatrix computeNodeTransform(FbxNode* pNode, FbxTime pTime = FBXSDK_TIME_INFINITE) {
+  // https://github.com/RevoluPowered/FBX-Document-Notes/blob/master/index.md
+  const FbxAMatrix nodeTransform = pNode->EvaluateLocalTransform(pTime);
+  const FbxAMatrix T = FbxAMatrix(nodeTransform.GetT(), FbxVector4(0, 0, 0, 0), FbxVector4(1, 1, 1, 1));
+  const FbxAMatrix Roff = FbxAMatrix(pNode->GetRotationOffset(fbxsdk::FbxNode::eSourcePivot), FbxVector4(0, 0, 0, 0), FbxVector4(1, 1, 1, 1));
+  const FbxAMatrix Rp = FbxAMatrix(pNode->GetRotationPivot(fbxsdk::FbxNode::eSourcePivot), FbxVector4(0, 0, 0, 0), FbxVector4(1, 1, 1, 1));
+  const FbxAMatrix Rpre = FbxAMatrix(pNode->GetPreRotation(fbxsdk::FbxNode::eSourcePivot), FbxVector4(0, 0, 0, 0), FbxVector4(1, 1, 1, 1));
+  const FbxAMatrix R = FbxAMatrix(FbxVector4(0, 0, 0, 0), nodeTransform.GetR(), FbxVector4(1, 1, 1, 1));
+  const FbxAMatrix Rpost = FbxAMatrix(FbxVector4(0, 0, 0, 0), pNode->GetPostRotation(fbxsdk::FbxNode::eSourcePivot), FbxVector4(1, 1, 1, 1));
+  const FbxAMatrix Soff = FbxAMatrix(pNode->GetScalingOffset(fbxsdk::FbxNode::eSourcePivot), FbxVector4(0, 0, 0, 0), FbxVector4(1, 1, 1, 1));
+  const FbxAMatrix Sp = FbxAMatrix(pNode->GetScalingPivot(fbxsdk::FbxNode::eSourcePivot), FbxVector4(0, 0, 0, 0), FbxVector4(1, 1, 1, 1));
+  const FbxAMatrix S = FbxAMatrix(FbxVector4(0, 0, 0, 0), FbxVector4(0, 0, 0, 0), nodeTransform.GetS());
+  return T * Roff * Rp * Rpre * R * Rpost.Inverse() * Rp.Inverse() * Soff * Sp * S * Sp.Inverse();
+}
+
 static bool TriangleTexturePolarity(const Vec2f& uv0, const Vec2f& uv1, const Vec2f& uv2) {
   const Vec2f d0 = uv1 - uv0;
   const Vec2f d1 = uv2 - uv0;
@@ -183,7 +198,7 @@ static void ReadMesh(
   const FbxVector4 meshRotation = pNode->GetGeometricRotation(FbxNode::eSourcePivot);
   const FbxVector4 meshScaling = pNode->GetGeometricScaling(FbxNode::eSourcePivot);
   const FbxAMatrix meshTransform(meshTranslation, meshRotation, meshScaling);
-  const FbxMatrix transform = meshTransform;
+  const FbxMatrix transform = meshTransform * computeNodeTransform(pNode);
 
   // Remove translation & scaling from transforms that will bi applied to normals, tangents &
   // binormals
@@ -665,24 +680,6 @@ static void ReadNodeAttributes(
   }
 }
 
-/**
- * Compute the local scale vector to use for a given node. This is an imperfect hack to cope with
- * the FBX node transform's eInheritRrs inheritance type, in which ancestral scale is ignored
- */
-static FbxVector4 computeLocalScale(FbxNode* pNode, FbxTime pTime = FBXSDK_TIME_INFINITE) {
-  const FbxVector4 lScale = pNode->EvaluateLocalTransform(pTime).GetS();
-
-  if (pNode->GetParent() == nullptr ||
-      pNode->GetTransform().GetInheritType() != FbxTransform::eInheritRrs) {
-    return lScale;
-  }
-  // This is a very partial fix that is only correct for models that use identity scale in their
-  // rig's joints. We could write better support that compares local scale to parent's global scale
-  // and apply the ratio to our local translation. We'll always want to return scale 1, though --
-  // that's the only way to encode the missing 'S' (parent scale) in the transform chain.
-  return FbxVector4(1, 1, 1, 1);
-}
-
 static void ReadNodeHierarchy(
     RawModel& raw,
     FbxScene* pScene,
@@ -724,10 +721,10 @@ static void ReadNodeHierarchy(
   }
 
   // Set the initial node transform.
-  const FbxAMatrix localTransform = pNode->EvaluateLocalTransform();
+  const FbxAMatrix localTransform = pNode->EvaluateLocalTransform() * computeNodeTransform(pNode);
   const FbxVector4 localTranslation = localTransform.GetT();
   const FbxQuaternion localRotation = localTransform.GetQ();
-  const FbxVector4 localScaling = computeLocalScale(pNode);
+  const FbxVector4 localScaling = localTransform.GetS();
 
   node.translation = toVec3f(localTranslation) * scaleFactor;
   node.rotation = toQuatf(localRotation);
@@ -834,7 +831,7 @@ static void ReadAnimations(RawModel& raw, FbxScene* pScene, const GltfOptions& o
     const int nodeCount = pScene->GetNodeCount();
     for (int nodeIndex = 0; nodeIndex < nodeCount; nodeIndex++) {
       FbxNode* pNode = pScene->GetNode(nodeIndex);
-      const FbxAMatrix baseTransform = pNode->EvaluateLocalTransform();
+      const FbxAMatrix baseTransform = pNode->EvaluateLocalTransform() * computeNodeTransform(pNode);
       const FbxVector4 baseTranslation = baseTransform.GetT();
       const FbxQuaternion baseRotation = baseTransform.GetQ();
       const FbxVector4 baseScaling = computeLocalScale(pNode);
@@ -846,10 +843,10 @@ static void ReadAnimations(RawModel& raw, FbxScene* pScene, const GltfOptions& o
         FbxTime pTime;
         pTime.SetFrame(frameIndex, eMode);
 
-        const FbxAMatrix localTransform = pNode->EvaluateLocalTransform(pTime);
+        const FbxAMatrix localTransform = pNode->EvaluateLocalTransform(pTime) * computeNodeTransform(pNode, pTime);
         const FbxVector4 localTranslation = localTransform.GetT();
         const FbxQuaternion localRotation = localTransform.GetQ();
-        const FbxVector4 localScale = computeLocalScale(pNode, pTime);
+        const FbxVector4 localScale = localTransform.GetS();
 
         channel.translations.push_back(toVec3f(localTranslation) * scaleFactor);
         channel.rotations.push_back(toQuatf(localRotation));
